@@ -1623,6 +1623,8 @@ class SimultaneousPtychographicOperator(AbstractPtychographicOperator):
                 .array
             )
 
+            probe_intensity = xp.sum(xp.abs(xp.fft.fft2(self._probes)) ** 2)
+            self._probes *= np.sqrt(self._mean_diffraction_intensity / probe_intensity)
             self._probes = (self._probes, self._probes.copy())
         else:
             if len(self._probes) != 2:
@@ -1630,10 +1632,15 @@ class SimultaneousPtychographicOperator(AbstractPtychographicOperator):
             if isinstance(self._probes[0], Probe):
                 if self._probes[0].gpts != self._region_of_interest_shape:
                     raise ValueError()
-                self._probes = tuple(
-                    copy_to_device(_probe.build().array, self._device)
-                    for _probe in self._probes
-                )
+
+                _probes = []
+                for _probe in self._probes:
+                    _probe = copy_to_device(_probe.build().array,self._device)
+                    probe_intensity = xp.sum(xp.abs(xp.fft.fft2(_probe)) ** 2)
+                    _probe *= np.sqrt(self._mean_diffraction_intensity / probe_intensity)
+                    _probes.append(_probe)
+                self._probes=tuple(_probes)
+
             else:
                 self._probes = tuple(
                     copy_to_device(_probe, self._device) for _probe in self._probes
@@ -4668,6 +4675,7 @@ class MultislicePtychographicOperator(AbstractPtychographicOperator):
         num_slices = slice_thicknesses.shape[0]
 
         if position_correction is not None:
+            position_step_size = reconstruction_parameters["position_step_size"]
             position = position_correction(
                 objects,
                 probes,
