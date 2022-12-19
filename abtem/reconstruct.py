@@ -39,6 +39,8 @@ reconstruction_symbols = {
     "pre_position_correction_update_steps": None,
     "pre_probe_correction_update_steps": None,
     "pure_phase_object_update_steps": None,
+    "probe_support_relative_radius": 1.0,
+    "probe_support_supergaussian_degree": 10.0,
 }
 
 
@@ -860,6 +862,7 @@ class RegularizedPtychographicOperator(AbstractPtychographicOperator):
         objects: np.ndarray,
         probes: np.ndarray,
         pure_phase_object: bool,
+        probe_support_mask: np.ndarray,
         xp=np,
         **kwargs,
     ):
@@ -874,6 +877,8 @@ class RegularizedPtychographicOperator(AbstractPtychographicOperator):
             Current probes array estimate
         pure_phase_object:bool
             If True, constraints object to being a pure phase object, i.e. with unit amplitude
+        probe_support_mask:np.ndarray
+            Supergaussian support mask
         xp
             Numerical programming module to use - either np or cp
 
@@ -884,12 +889,18 @@ class RegularizedPtychographicOperator(AbstractPtychographicOperator):
         probes: np.ndarray
             Constrained probes array
         """
+
         phase = xp.exp(1.0j * xp.angle(objects))
         if pure_phase_object:
             amplitude = 1.0
         else:
             amplitude = xp.minimum(xp.abs(objects), 1.0)
-        return amplitude * phase, probes
+        objects = amplitude * phase
+
+        if probe_support_mask is not None:
+            probes *= probe_support_mask
+
+        return objects, probes
 
     """
     @staticmethod
@@ -1192,8 +1203,18 @@ class RegularizedPtychographicOperator(AbstractPtychographicOperator):
 
         self._functions_queue = functions_queue
 
-        ### Main Loop
+        # Probe support mask initialization
         xp = get_array_module_from_device(self._device)
+        x = xp.linspace(-1, 1, self._region_of_interest_shape[0], endpoint=False)
+        y = xp.linspace(-1, 1, self._region_of_interest_shape[1], endpoint=False)
+        xx, yy = xp.meshgrid(x, y, indexing="ij")
+        deg = self._reconstruction_parameters["probe_support_supergaussian_degree"]
+        radius = self._reconstruction_parameters["probe_support_relative_radius"]
+        self._probe_support_mask = xp.exp(
+            -(((xx / radius) ** 2 + (yy / radius) ** 2) ** deg)
+        )
+
+        ### Main Loop
         outer_pbar = ProgressBar(total=max_iterations, leave=False)
         inner_pbar = ProgressBar(total=self._num_diffraction_patterns, leave=False)
         indices = np.arange(self._num_diffraction_patterns)
@@ -1250,6 +1271,8 @@ class RegularizedPtychographicOperator(AbstractPtychographicOperator):
                         ]
                     )
 
+                probe_support_mask = None if fix_probe else self._probe_support_mask
+
                 if (
                     self._reconstruction_parameters["pure_phase_object_update_steps"]
                     is None
@@ -1298,7 +1321,11 @@ class RegularizedPtychographicOperator(AbstractPtychographicOperator):
                 )
 
                 self._objects, self._probes = _constraints_function(
-                    self._objects, self._probes, pure_phase_object, xp=xp
+                    self._objects,
+                    self._probes,
+                    pure_phase_object,
+                    probe_support_mask,
+                    xp=xp,
                 )
 
                 old_position = position
@@ -1635,11 +1662,13 @@ class SimultaneousPtychographicOperator(AbstractPtychographicOperator):
 
                 _probes = []
                 for _probe in self._probes:
-                    _probe = copy_to_device(_probe.build().array,self._device)
+                    _probe = copy_to_device(_probe.build().array, self._device)
                     probe_intensity = xp.sum(xp.abs(xp.fft.fft2(_probe)) ** 2)
-                    _probe *= np.sqrt(self._mean_diffraction_intensity / probe_intensity)
+                    _probe *= np.sqrt(
+                        self._mean_diffraction_intensity / probe_intensity
+                    )
                     _probes.append(_probe)
-                self._probes=tuple(_probes)
+                self._probes = tuple(_probes)
 
             else:
                 self._probes = tuple(
@@ -2404,6 +2433,7 @@ class SimultaneousPtychographicOperator(AbstractPtychographicOperator):
         objects: Sequence[np.ndarray],
         probes: Sequence[np.ndarray],
         pure_phase_object: bool,
+        probe_support_mask: np.ndarray,
         xp=np,
         **kwargs,
     ):
@@ -2418,6 +2448,8 @@ class SimultaneousPtychographicOperator(AbstractPtychographicOperator):
             Current probes array estimate
         pure_phase_object:bool
             If True, constraints object to being a pure phase object, i.e. with unit amplitude
+        probe_support_mask:np.ndarray
+            Supergaussian support mask
         xp
             Numerical programming module to use - either np or cp
 
@@ -2438,7 +2470,16 @@ class SimultaneousPtychographicOperator(AbstractPtychographicOperator):
         else:
             amplitude_e = xp.minimum(xp.abs(electrostatic_object), 1.0)
             amplitude_m = xp.minimum(xp.abs(magnetic_object), 1.0)
-        return (amplitude_e * phase_e, amplitude_m * phase_m), probes
+
+        electrostatic_object = amplitude_e * phase_e
+        magnetic_object = amplitude_m * phase_m
+
+        probes_forward, probes_reverse = probes
+        if probe_support_mask is not None:
+            probes_forward *= probe_support_mask
+            probes_reverse *= probe_support_mask
+
+        return (electrostatic_object, magnetic_object), (probes_forward, probes_reverse)
 
     @staticmethod
     def _position_correction(
@@ -2794,8 +2835,18 @@ class SimultaneousPtychographicOperator(AbstractPtychographicOperator):
 
         self._functions_queue = functions_queue
 
-        ### Main Loop
+        # Probe support mask initialization
         xp = get_array_module_from_device(self._device)
+        x = xp.linspace(-1, 1, self._region_of_interest_shape[0], endpoint=False)
+        y = xp.linspace(-1, 1, self._region_of_interest_shape[1], endpoint=False)
+        xx, yy = xp.meshgrid(x, y, indexing="ij")
+        deg = self._reconstruction_parameters["probe_support_supergaussian_degree"]
+        radius = self._reconstruction_parameters["probe_support_relative_radius"]
+        self._probe_support_mask = xp.exp(
+            -(((xx / radius) ** 2 + (yy / radius) ** 2) ** deg)
+        )
+
+        ### Main Loop
         outer_pbar = ProgressBar(total=max_iterations, leave=False)
         inner_pbar = ProgressBar(total=self._num_diffraction_patterns, leave=False)
         indices = np.arange(self._num_diffraction_patterns)
@@ -2855,6 +2906,8 @@ class SimultaneousPtychographicOperator(AbstractPtychographicOperator):
                         ]
                     )
 
+                probe_support_mask = None if fix_probe else self._probe_support_mask
+
                 if (
                     self._reconstruction_parameters["pure_phase_object_update_steps"]
                     is None
@@ -2908,7 +2961,11 @@ class SimultaneousPtychographicOperator(AbstractPtychographicOperator):
                 )
 
                 self._objects, self._probes = _constraints_function(
-                    self._objects, self._probes, pure_phase_object, xp=xp
+                    self._objects,
+                    self._probes,
+                    pure_phase_object,
+                    probe_support_mask,
+                    xp=xp,
                 )
 
                 old_position = position
@@ -3661,6 +3718,7 @@ class MixedStatePtychographicOperator(AbstractPtychographicOperator):
         objects: np.ndarray,
         probes: np.ndarray,
         pure_phase_object: bool,
+        probe_support_mask: np.ndarray,
         xp=np,
         **kwargs,
     ):
@@ -3675,6 +3733,8 @@ class MixedStatePtychographicOperator(AbstractPtychographicOperator):
             Current probes array estimate
         pure_phase_object:bool
             If True, constraints object to being a pure phase object, i.e. with unit amplitude
+        probe_support_mask:np.ndarray
+            Supergaussian support mask
         xp
             Numerical programming module to use - either np or cp
 
@@ -3690,6 +3750,10 @@ class MixedStatePtychographicOperator(AbstractPtychographicOperator):
             amplitude = 1.0
         else:
             amplitude = xp.minimum(xp.abs(objects), 1.0)
+
+        if probe_support_mask is not None:
+            probes *= probe_support_mask
+
         return amplitude * phase, probes
 
     @staticmethod
@@ -4022,8 +4086,18 @@ class MixedStatePtychographicOperator(AbstractPtychographicOperator):
 
         self._functions_queue = functions_queue
 
-        ### Main Loop
+        # Probe support mask initialization
         xp = get_array_module_from_device(self._device)
+        x = xp.linspace(-1, 1, self._region_of_interest_shape[0], endpoint=False)
+        y = xp.linspace(-1, 1, self._region_of_interest_shape[1], endpoint=False)
+        xx, yy = xp.meshgrid(x, y, indexing="ij")
+        deg = self._reconstruction_parameters["probe_support_supergaussian_degree"]
+        radius = self._reconstruction_parameters["probe_support_relative_radius"]
+        self._probe_support_mask = xp.exp(
+            -(((xx / radius) ** 2 + (yy / radius) ** 2) ** deg)
+        )
+
+        ### Main Loop
         outer_pbar = ProgressBar(total=max_iterations, leave=False)
         inner_pbar = ProgressBar(total=self._num_diffraction_patterns, leave=False)
         indices = np.arange(self._num_diffraction_patterns)
@@ -4079,6 +4153,8 @@ class MixedStatePtychographicOperator(AbstractPtychographicOperator):
                             "pre_probe_correction_update_steps"
                         ]
                     )
+
+                probe_support_mask = None if fix_probe else self._probe_support_mask
 
                 if (
                     self._reconstruction_parameters["pure_phase_object_update_steps"]
@@ -4136,7 +4212,11 @@ class MixedStatePtychographicOperator(AbstractPtychographicOperator):
                 )
 
                 self._objects, self._probes = _constraints_function(
-                    self._objects, self._probes, pure_phase_object, xp=xp
+                    self._objects,
+                    self._probes,
+                    pure_phase_object,
+                    probe_support_mask,
+                    xp=xp,
                 )
 
                 old_position = position
@@ -4736,6 +4816,7 @@ class MultislicePtychographicOperator(AbstractPtychographicOperator):
         objects: np.ndarray,
         probes: np.ndarray,
         pure_phase_object: bool,
+        probe_support_mask: np.ndarray,
         xp=np,
         **kwargs,
     ):
@@ -4750,6 +4831,8 @@ class MultislicePtychographicOperator(AbstractPtychographicOperator):
             Current probes array estimate
         pure_phase_object:bool
             If True, constraints object to being a pure phase object, i.e. with unit amplitude
+        probe_support_mask:np.ndarray
+            Supergaussian support mask
         xp
             Numerical programming module to use - either np or cp
 
@@ -4765,6 +4848,10 @@ class MultislicePtychographicOperator(AbstractPtychographicOperator):
             amplitude = 1.0
         else:
             amplitude = xp.minimum(xp.abs(objects), 1.0)
+
+        if probe_support_mask is not None:
+            probes[0] *= probe_support_mask
+
         return amplitude * phase, probes
 
     @staticmethod
@@ -5033,8 +5120,18 @@ class MultislicePtychographicOperator(AbstractPtychographicOperator):
 
         self._functions_queue = functions_queue
 
-        ### Main Loop
+        # Probe support mask initialization
         xp = get_array_module_from_device(self._device)
+        x = xp.linspace(-1, 1, self._region_of_interest_shape[0], endpoint=False)
+        y = xp.linspace(-1, 1, self._region_of_interest_shape[1], endpoint=False)
+        xx, yy = xp.meshgrid(x, y, indexing="ij")
+        deg = self._reconstruction_parameters["probe_support_supergaussian_degree"]
+        radius = self._reconstruction_parameters["probe_support_relative_radius"]
+        self._probe_support_mask = xp.exp(
+            -(((xx / radius) ** 2 + (yy / radius) ** 2) ** deg)
+        )
+
+        ### Main Loop
         outer_pbar = ProgressBar(total=max_iterations, leave=False)
         inner_pbar = ProgressBar(total=self._num_diffraction_patterns, leave=False)
         indices = np.arange(self._num_diffraction_patterns)
@@ -5093,6 +5190,8 @@ class MultislicePtychographicOperator(AbstractPtychographicOperator):
                             "pre_probe_correction_update_steps"
                         ]
                     )
+
+                probe_support_mask = None if fix_probe else self._probe_support_mask
 
                 if (
                     self._reconstruction_parameters["pure_phase_object_update_steps"]
@@ -5156,7 +5255,11 @@ class MultislicePtychographicOperator(AbstractPtychographicOperator):
                 )
 
                 self._objects, self._probes = _constraints_function(
-                    self._objects, self._probes, pure_phase_object, xp=xp
+                    self._objects,
+                    self._probes,
+                    pure_phase_object,
+                    probe_support_mask,
+                    xp=xp,
                 )
 
                 old_position = position
