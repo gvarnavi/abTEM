@@ -249,7 +249,8 @@ def fft_interpolate_2d(array, new_shape, normalization='values', overwrite_x=Fal
         cropped = fft_crop(fft2(array), new_shape)
         array = ifft2(cropped, overwrite_x=overwrite_x)
     else:
-        array = xp.complex64(array)
+        #array = xp.complex64(array)
+        array = array.astype(xp.complex64)
         array = ifft2(fft_crop(fft2(array), new_shape), overwrite_x=overwrite_x).real
 
     if normalization == 'values':

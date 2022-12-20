@@ -9,7 +9,7 @@ from abtem.measure import Measurement, Calibration
 from abtem.waves import Probe, FresnelPropagator
 from abtem.base_classes import AntialiasFilter
 from abtem.transfer import CTF, polar_symbols, polar_aliases
-from abtem.utils import fft_shift, energy2wavelength, ProgressBar
+from abtem.utils import fft_shift, energy2wavelength, ProgressBar, fft_interpolate_2d
 from abtem.device import (
     copy_to_device,
     get_array_module,
@@ -259,6 +259,8 @@ class AbstractPtychographicOperator(metaclass=ABCMeta):
 
         return polar_parameters, experimental_parameters
 
+    '''
+        
     @staticmethod
     def _pad_diffraction_patterns(
         diffraction_patterns: np.ndarray, region_of_interest_shape: Sequence[int]
@@ -305,6 +307,48 @@ class AbstractPtychographicOperator(metaclass=ABCMeta):
             )
 
         return diffraction_patterns
+    '''
+
+    @staticmethod
+    def _fft_resample_diffraction_patterns(
+        diffraction_patterns: np.ndarray,
+        region_of_interest_shape: Sequence[int],
+        angular_sampling: Sequence[float],
+    ):
+        """
+        Common static method to zero-pad CBED patterns to a certain region of interest shape.
+
+        Parameters
+        ----------
+        diffraction_patterns: (J,M,N) np.ndarray
+            Flat array of CBED patterns to be fourier resampled
+        region_of_interest_shape: (2,) Sequence[int]
+            Pixel dimensions (R,S) the CBED patterns will be padded to
+
+        Returns
+        -------
+        resampled_diffraction_patterns: (J,R,S) np.ndarray
+            Fourier resampled CBED patterns
+        """
+
+        diffraction_patterns_size = diffraction_patterns.shape
+
+        if (
+            diffraction_patterns_size[-2] != region_of_interest_shape[0]
+            or diffraction_patterns_size[-1] != region_of_interest_shape[1]
+        ):
+            new_size = diffraction_patterns_size[:-2] + region_of_interest_shape
+            diffraction_patterns = fft_interpolate_2d(diffraction_patterns, new_size)
+            angular_sampling = tuple(
+                ang_sampling * old / new
+                for ang_sampling, old, new in zip(
+                    angular_sampling,
+                    diffraction_patterns_size[-2:],
+                    region_of_interest_shape,
+                )
+            )
+
+        return diffraction_patterns, angular_sampling
 
     @staticmethod
     def _extract_calibrations_from_measurement_object(
@@ -431,7 +475,7 @@ class AbstractPtychographicOperator(metaclass=ABCMeta):
         if not self._preprocessed:
             return None
 
-        return self._experimental_parameters["angular_sampling"]
+        return self._angular_sampling
 
     @property
     def sampling(self):
@@ -579,16 +623,22 @@ class RegularizedPtychographicOperator(AbstractPtychographicOperator):
         if self._region_of_interest_shape is None:
             self._region_of_interest_shape = self._diffraction_patterns.shape[-2:]
 
-        self._diffraction_patterns = self._pad_diffraction_patterns(
-            self._diffraction_patterns, self._region_of_interest_shape
+        (
+            self._diffraction_patterns,
+            self._angular_sampling,
+        ) = self._fft_resample_diffraction_patterns(
+            self._diffraction_patterns,
+            self._region_of_interest_shape,
+            self._experimental_parameters["angular_sampling"],
         )
         self._num_diffraction_patterns = self._diffraction_patterns.shape[0]
 
-        if self._experimental_parameters["background_counts_cutoff"] is not None:
-            self._diffraction_patterns[
-                self._diffraction_patterns
-                < self._experimental_parameters["background_counts_cutoff"]
-            ] = 0.0
+        if self._experimental_parameters["background_counts_cutoff"] is None:
+            self._experimental_parameters["background_counts_cutoff"] = 0.0
+        self._diffraction_patterns[
+            self._diffraction_patterns
+            < self._experimental_parameters["background_counts_cutoff"]
+        ] = 0.0
 
         if self._experimental_parameters["counts_scaling_factor"] is not None:
             self._diffraction_patterns /= self._experimental_parameters[
@@ -1554,15 +1604,21 @@ class SimultaneousPtychographicOperator(AbstractPtychographicOperator):
         xp = get_array_module_from_device(self._device)
         _diffraction_patterns = []
         self._mean_diffraction_intensity = 0
+        if self._experimental_parameters["background_counts_cutoff"] is None:
+            self._experimental_parameters["background_counts_cutoff"] = 0.0
         for dp in self._diffraction_patterns:
 
             # Convert Measurement Objects
             if isinstance(dp, Measurement):
                 (
                     _dp,
-                    angular_sampling,
+                    self._angular_sampling,
                     step_sizes,
                 ) = self._extract_calibrations_from_measurement_object(dp, self._energy)
+            else:
+                self._angular_sampling = self._experimental_parameters[
+                    "angular_sampling"
+                ]
 
             # Preprocess Diffraction Patterns
             _dp = copy_to_device(_dp, self._device)
@@ -1573,12 +1629,14 @@ class SimultaneousPtychographicOperator(AbstractPtychographicOperator):
 
             if self._region_of_interest_shape is None:
                 self._region_of_interest_shape = _dp.shape[-2:]
-            _dp = self._pad_diffraction_patterns(_dp, self._region_of_interest_shape)
 
-            if self._experimental_parameters["background_counts_cutoff"] is not None:
-                _dp[
-                    _dp < self._experimental_parameters["background_counts_cutoff"]
-                ] = 0.0
+            _dp, self._angular_sampling = self._fft_resample_diffraction_patterns(
+                _dp,
+                self._region_of_interest_shape,
+                self._angular_sampling,
+            )
+
+            _dp[_dp < self._experimental_parameters["background_counts_cutoff"]] = 0.0
 
             if self._experimental_parameters["counts_scaling_factor"] is not None:
                 _dp /= self._experimental_parameters["counts_scaling_factor"]
@@ -1588,7 +1646,6 @@ class SimultaneousPtychographicOperator(AbstractPtychographicOperator):
             _diffraction_patterns.append(_dp)
 
         self._diffraction_patterns = tuple(_diffraction_patterns)
-        self._experimental_parameters["angular_sampling"] = angular_sampling
         self._num_diffraction_patterns = self._diffraction_patterns[0].shape[0]
 
         self._mean_diffraction_intensity /= 2 * self._num_diffraction_patterns
@@ -3224,16 +3281,22 @@ class MixedStatePtychographicOperator(AbstractPtychographicOperator):
         if self._region_of_interest_shape is None:
             self._region_of_interest_shape = self._diffraction_patterns.shape[-2:]
 
-        self._diffraction_patterns = self._pad_diffraction_patterns(
-            self._diffraction_patterns, self._region_of_interest_shape
+        (
+            self._diffraction_patterns,
+            self._angular_sampling,
+        ) = self._fft_resample_diffraction_patterns(
+            self._diffraction_patterns,
+            self._region_of_interest_shape,
+            self._experimental_parameters["angular_sampling"],
         )
         self._num_diffraction_patterns = self._diffraction_patterns.shape[0]
 
-        if self._experimental_parameters["background_counts_cutoff"] is not None:
-            self._diffraction_patterns[
-                self._diffraction_patterns
-                < self._experimental_parameters["background_counts_cutoff"]
-            ] = 0.0
+        if self._experimental_parameters["background_counts_cutoff"] is None:
+            self._experimental_parameters["background_counts_cutoff"] = 0.0
+        self._diffraction_patterns[
+            self._diffraction_patterns
+            < self._experimental_parameters["background_counts_cutoff"]
+        ] = 0.0
 
         if self._experimental_parameters["counts_scaling_factor"] is not None:
             self._diffraction_patterns /= self._experimental_parameters[
@@ -4485,16 +4548,22 @@ class MultislicePtychographicOperator(AbstractPtychographicOperator):
         if self._region_of_interest_shape is None:
             self._region_of_interest_shape = self._diffraction_patterns.shape[-2:]
 
-        self._diffraction_patterns = self._pad_diffraction_patterns(
-            self._diffraction_patterns, self._region_of_interest_shape
+        (
+            self._diffraction_patterns,
+            self._angular_sampling,
+        ) = self._fft_resample_diffraction_patterns(
+            self._diffraction_patterns,
+            self._region_of_interest_shape,
+            self._experimental_parameters["angular_sampling"],
         )
         self._num_diffraction_patterns = self._diffraction_patterns.shape[0]
 
-        if self._experimental_parameters["background_counts_cutoff"] is not None:
-            self._diffraction_patterns[
-                self._diffraction_patterns
-                < self._experimental_parameters["background_counts_cutoff"]
-            ] = 0.0
+        if self._experimental_parameters["background_counts_cutoff"] is None:
+            self._experimental_parameters["background_counts_cutoff"] = 0.0
+        self._diffraction_patterns[
+            self._diffraction_patterns
+            < self._experimental_parameters["background_counts_cutoff"]
+        ] = 0.0
 
         if self._experimental_parameters["counts_scaling_factor"] is not None:
             self._diffraction_patterns /= self._experimental_parameters[
